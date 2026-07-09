@@ -139,3 +139,7 @@ so make sure Step 1 has completed and that folder exists before launching.
 **AG News** — 4-class news topic classification dataset, loaded automatically
 via `datasets.load_dataset("ag_news")`. Classes: `World`, `Sports`, `Business`,
 `Sci/Tech`.
+
+## Result
+
+![Streamlit App Screenshot](results)

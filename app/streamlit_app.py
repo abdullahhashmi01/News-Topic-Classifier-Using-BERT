@@ -1,83 +1,130 @@
-"""
-Streamlit app for live interaction with the fine-tuned News Topic Classifier.
-
-Run with:
-    streamlit run app/streamlit_app.py
-"""
-
-import os
-import sys
-
 import streamlit as st
+import torch
+import torch.nn.functional as F
 import pandas as pd
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
-# Allow importing the `src` package when run as `streamlit run app/streamlit_app.py`
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+MODEL_PATH = "models/bert-ag-news"
+MAX_LEN = 128
+LABEL_NAMES = ["World", "Sports", "Business", "Sci/Tech"]
 
-from src import config
-from src.predict import NewsTopicClassifier
-
-st.set_page_config(
-    page_title="News Topic Classifier (BERT)",
-    page_icon="📰",
-    layout="centered",
-)
+st.set_page_config(page_title="News Topic Classifier", page_icon="📰", layout="centered")
 
 
-@st.cache_resource(show_spinner="Loading fine-tuned BERT model ...")
-def load_classifier():
-    return NewsTopicClassifier(config.MODEL_OUTPUT_DIR)
+@st.cache_resource
+def load_model():
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+    model = AutoModelForSequenceClassification.from_pretrained(MODEL_PATH)
+    model.eval()
+    return tokenizer, model
+
+
+def predict(texts, tokenizer, model):
+    """Runs inference on a list of texts, returns a list of probability tensors."""
+    inputs = tokenizer(
+        texts,
+        return_tensors="pt",
+        truncation=True,
+        padding=True,
+        max_length=MAX_LEN,
+    )
+    with torch.no_grad():
+        logits = model(**inputs).logits
+    probs = F.softmax(logits, dim=-1)
+    return probs
 
 
 st.title("📰 News Topic Classifier")
-st.caption(
-    "Fine-tuned `bert-base-uncased` on the AG News dataset — "
-    "classifies a headline/article into World, Sports, Business, or Sci/Tech."
-)
+st.caption("BERT fine-tuned on AG News — classifies text into World, Sports, Business, or Sci/Tech")
 
 try:
-    clf = load_classifier()
-    model_loaded = True
+    tokenizer, model = load_model()
 except Exception as e:
-    model_loaded = False
     st.error(
-        "Could not load a fine-tuned model from "
-        f"`{config.MODEL_OUTPUT_DIR}`.\n\n"
-        "Train it first with:\n```\npython -m src.train\n```\n\n"
-        f"Underlying error: {e}"
+        f"Could not load the model from `{MODEL_PATH}`. "
+        f"Make sure the model files (config.json, model.safetensors, tokenizer.json, "
+        f"tokenizer_config.json, vocab.txt) are in that folder.\n\nError: {e}"
+    )
+    st.stop()
+
+tab_single, tab_batch = st.tabs(["🔤 Single text", "📋 Batch (multiple texts)"])
+
+# ---------------- Single text mode ----------------
+with tab_single:
+    text = st.text_area(
+        "Enter a news headline or article snippet",
+        placeholder="e.g. Apple unveils new AI chip that boosts iPhone performance",
+        height=100,
     )
 
-text_input = st.text_area(
-    "Enter a news headline or short article:",
-    placeholder="e.g. NASA's new telescope captures stunning images of a distant galaxy",
-    height=120,
-)
+    if st.button("Classify", type="primary", key="single_btn"):
+        if not text.strip():
+            st.warning("Please enter some text first.")
+        else:
+            probs = predict([text], tokenizer, model)[0]
+            pred_idx = int(probs.argmax())
+            pred_label = LABEL_NAMES[pred_idx]
+            confidence = float(probs[pred_idx])
 
-col1, col2 = st.columns([1, 3])
-predict_clicked = col1.button("Classify", type="primary", disabled=not model_loaded)
+            st.success(f"**Predicted category: {pred_label}**  ({confidence:.1%} confidence)")
 
-if predict_clicked:
-    if not text_input.strip():
-        st.warning("Please enter some text first.")
-    else:
-        label, probs = clf.predict(text_input)
-        st.success(f"Predicted Topic: **{label}**")
+            st.write("Confidence across all categories:")
+            for label, p in zip(LABEL_NAMES, probs.tolist()):
+                st.write(f"{label}")
+                st.progress(p, text=f"{p:.1%}")
 
-        df = pd.DataFrame(
-            {"Topic": list(probs.keys()), "Probability": list(probs.values())}
-        ).sort_values("Probability", ascending=False)
+# ---------------- Batch mode ----------------
+with tab_batch:
+    st.write("Paste multiple texts, one per line, or upload a CSV with a `text` column.")
 
-        st.bar_chart(df.set_index("Topic"))
-        st.dataframe(df, hide_index=True, use_container_width=True)
+    batch_text = st.text_area(
+        "One text per line",
+        placeholder="Local team wins championship after dramatic overtime finish\nCentral bank raises interest rates amid inflation concerns",
+        height=150,
+    )
+
+    uploaded_csv = st.file_uploader("Or upload a CSV file with a 'text' column", type=["csv"])
+
+    if st.button("Classify batch", type="primary", key="batch_btn"):
+        texts = []
+
+        if uploaded_csv is not None:
+            df_in = pd.read_csv(uploaded_csv)
+            if "text" not in df_in.columns:
+                st.error("CSV must have a column named 'text'.")
+            else:
+                texts = df_in["text"].dropna().astype(str).tolist()
+        elif batch_text.strip():
+            texts = [line.strip() for line in batch_text.split("\n") if line.strip()]
+
+        if not texts:
+            st.warning("Please enter some lines of text or upload a CSV.")
+        else:
+            with st.spinner(f"Classifying {len(texts)} texts..."):
+                probs = predict(texts, tokenizer, model)
+
+            rows = []
+            for text_item, p in zip(texts, probs):
+                pred_idx = int(p.argmax())
+                row = {
+                    "text": text_item,
+                    "predicted_category": LABEL_NAMES[pred_idx],
+                    "confidence": float(p[pred_idx]),
+                }
+                for label, prob in zip(LABEL_NAMES, p.tolist()):
+                    row[f"prob_{label}"] = prob
+                rows.append(row)
+
+            result_df = pd.DataFrame(rows)
+            st.dataframe(result_df, use_container_width=True)
+
+            csv_out = result_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download results as CSV",
+                data=csv_out,
+                file_name="predictions.csv",
+                mime="text/csv",
+            )
 
 st.divider()
-with st.expander("ℹ️ About this app"):
-    st.write(
-        """
-        - **Model**: bert-base-uncased, fine-tuned via Hugging Face `Trainer`
-        - **Dataset**: AG News (World / Sports / Business / Sci-Tech)
-        - **Metrics tracked during training**: accuracy, F1 (macro & weighted)
-        - Run `python -m src.train` to (re)train, then `python -m src.evaluate`
-          to generate the confusion matrix and metrics report.
-        """
-    )
+st.caption(f"Model loaded from: `{MODEL_PATH}`")

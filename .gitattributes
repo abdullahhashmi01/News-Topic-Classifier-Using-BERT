@@ -1,0 +1,2 @@
+models/bert-ag-news/*.safetensors filter=lfs diff=lfs merge=lfs -text
+models/bert-ag-news/*.bin filter=lfs diff=lfs merge=lfs -text
